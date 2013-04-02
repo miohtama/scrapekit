@@ -7,7 +7,7 @@ Installation
     curl -L -o virtualenv.py https://raw.github.com/pypa/virtualenv/master/virtualenv.py
     python virtualenv.py venv
     . venv/bin/activate
-    pip install selenium gspread
+    pip install selenium gspread ipdb
 
 Running
 -----------------
@@ -20,3 +20,7 @@ Alternative solutions
 ------------------------
 
 * http://nrabinowitz.github.com/pjscrape/
+
+* `Selenium WebDriver API <http://code.google.com/p/selenium/source/browse/py/selenium/webdriver/remote/webdriver.py>`_
+
+* `Selenium WebElement API <http://code.google.com/p/selenium/source/browse/py/selenium/webdriver/remote/webelement.py>`_
