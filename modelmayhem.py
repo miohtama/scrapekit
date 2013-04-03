@@ -10,6 +10,8 @@ __license__ = "BSD"
 
 import os
 import sys
+import datetime
+from urllib2 import HTTPError
 
 import gspread
 from selenium import webdriver
@@ -18,6 +20,7 @@ from selenium.webdriver.common.by import By
 from seleniumhelper import wait_and_find
 
 
+#: Arbirary hard limit how much data we want to store in spreadsheer ourselves
 MAX_ENTRIES = 1000
 
 
@@ -49,19 +52,30 @@ def get_browser():
 def scrape_sub_page(browser, worksheet, url):
     """ Enter into a data page and grab relevant information.
 
-    :yield: Dictionary of scraped data
+    This is the place where magic happens.
+    We read the data off the page based on HTML layout / CSS
+    classes the elements have.
+
+    :return: Dictionary of scraped data
     """
 
-    data = dict(url=url)
+    data = dict()
+
+    data["url"] = url
+    data["updated"] = datetime.datetime.now()
 
     print "Scraping result page: %s" % url
     browser.get(url)
+
+    data["name"] = browser.find_element_by_css_selector("table.maintable table h1").text
+    data["homepage"] = browser.find_element_by_css_selector("table.maintable table a").get_attribute("href")
+
     browser.back()
 
     return data
 
 
-def scrape_model_mayhem(browser, worksheet, number_of_pages=10):
+def scrape_model_mayhem(browser, worksheet, number_of_pages=5):
     """ Scrape model mayhem database for emails and Facebook addresses.
 
     We pass the CAPTCHA by using actual human input
@@ -79,25 +93,35 @@ def scrape_model_mayhem(browser, worksheet, number_of_pages=10):
         browser.find_element_by_css_selector("input[name='submit']").click()
 
         # Wait to see if we get a page which looks like search results
-        submit_success_indicator = wait_and_find(browser, By.PARTIAL_LINK_TEXT, "Refine Search", allow_timeout=True)
+        submit_success_indicator = wait_and_find(browser, By.PARTIAL_LINK_TEXT, "Refine Search", allow_timeout=True, timeout=3.0)
         if submit_success_indicator:
             passed_captcha = True
 
-    page = 1
-    # Scrape each seacrh result page individually
+    page = 0
+    links = []
+
+    # First we scrape search results, all pages of them,
+    # for links to individual data pages
     while page < number_of_pages:
 
         print "Scraping results page %d" % page
 
         records = browser.find_elements_by_css_selector(".bMemberData")
 
-        # Click each search result individually
+        # We scrape all links to array first,
+        # because visiting subpages in scrape_sub_page() break our WebDriver
+        # cached DOM tree and we cannot iterate it directly
+        links = []
         for rec in records:
             link = rec.find_element_by_css_selector("a.bold")
             href = link.get_attribute("href")
-            yield scrape_sub_page(browser, worksheet, href)
+            links.append(href)
 
         page += 1
+        browser.find_element_by_partial_link_text("Next").click()
+
+    for href in links:
+        yield scrape_sub_page(browser, worksheet, href)
 
 
 def find_append_row(worksheet):
@@ -111,21 +135,70 @@ def find_append_row(worksheet):
     return -1
 
 
-def store_entry(worksheet, entry, append_row):
+def get_column_labels(worksheet):
+    """ Get label -> column id mappings.
+
+    This way we know in which columns to store entry data even
+    if the user is to shuffle the columns.
+
+    Assume labels are on the first row. Also make
+    sure all labels are lowercase in internal use.
+
+    :return: label name -> column index dict
+    """
+
+    columns = {}
+
+    labels = worksheet.row_values(1)
+    for i in range(len(labels)):
+        label = labels[i].lower()
+        columns[label] = i
+
+    return columns
+
+
+def store_entry(worksheet, columns, entry, append_row):
     """ Push scraped entry up to the Google spreadsheet.
 
-    Use link as the source key.
+    Use the orignal page link as the primary key, so
+    we can update old entries without readding them.
     """
 
     # Unique id used to recog. already stored entries
     entry_id = entry["url"]
-    cell = worksheet.find(entry_id)
+
+    try:
+        cell = worksheet.find(entry_id)
+    except gspread.exceptions.CellNotFound:
+        cell = None
 
     if cell:
+        # Update existing row
         row = cell.row
     else:
-        # Find first empty row
+        # Fill in first empty row
         row = append_row
+
+    # T is the last column in default empty spreadsheet
+    cell_range = 'A%d:T%d' % (row, row)
+
+    try:
+        cell_list = worksheet.range(cell_range)
+    except HTTPError as e:
+        # Otherwise the actual exception message is never shown
+        raise RuntimeError("Exception from Spreadsheet API: %s" % e.read())
+
+    for key, value in entry.items():
+        try:
+            index = columns[key]
+        except KeyError:
+            raise RuntimeError("Did not find column to store %s. Has columns: %s" % (key, columns))
+
+        # Update values in the cell range
+        if value is not None:
+            cell_list[index].value = value
+
+    worksheet.update_cells(cell_list)
 
     return row
 
@@ -140,11 +213,15 @@ def main():
     if append_row < 0:
         sys.exit("The spreadsheet is full / no empty rows available")
 
+    columns = get_column_labels(worksheet)
+    if not columns:
+        sys.exit("Could not read column labels on the spreadsheet: %s" % os.environ["GOOGLE_SPREADSHEET"])
+
     # Open a WebDriven browser instance for scraping
     browser = get_browser()
 
     for entry in scrape_model_mayhem(browser, worksheet):
-        stored_row = store_entry(worksheet, entry, append_row)
+        stored_row = store_entry(worksheet, columns, entry, append_row)
 
         # We just filled the last row?
         if stored_row == append_row:
